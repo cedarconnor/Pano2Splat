@@ -1,0 +1,31 @@
+# Core — install torch+torchvision FIRST from the cu126 index:
+#   uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+torch>=2.7.0
+torchvision>=0.20.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Gaussian splatting (JIT-compiles CUDA kernels — needs MSVC via vcvars64.bat on Windows)
+gsplat>=1.5.0
+
+# Attention acceleration (Windows)
+# Install xformers from PyTorch cu126 index:
+#   uv pip install xformers --index-url https://download.pytorch.org/whl/cu126
+# Install flash-attn from prebuilt wheel (match your torch+CUDA version):
+#   uv pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.12/flash_attn-2.8.3%2Bcu126torch2.10-cp311-cp311-win_amd64.whl
+xformers>=0.0.29
+flash-attn>=2.5.0
+triton-windows>=3.0.0
+sageattention>=1.0.0
+
+# Metrics
+lpips>=0.1.4
+pytorch-msssim>=1.0.0
+
+# Config
+PyYAML>=6.0
+
+# Utilities
+tqdm>=4.65.0
+plyfile>=1.0
+imageio>=2.31.0

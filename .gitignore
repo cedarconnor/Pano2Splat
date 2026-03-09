@@ -1,0 +1,52 @@
+# Pipeline outputs
+pipeline_output/
+
+# Internal docs and task tracking
+AGENTS.md
+docs/
+tasks/
+
+# Third-party dependencies (contents, not submodule refs)
+third_party/*
+!third_party/One2Scene
+
+# Model weights
+models/
+*.ckpt
+*.safetensors
+
+# PLY files (large binary)
+*.ply
+*.splat
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
+.venv/
+venv/
+*.env
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/

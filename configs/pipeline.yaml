@@ -1,0 +1,112 @@
+# Pano2Splat Master Configuration
+# All tunable parameters in one place.
+
+# --- Paths ---
+input:
+  panorama: "./input/panorama.jpg"
+
+output:
+  root: "./pipeline_output"
+  stage_a: "${output.root}/stage_a"
+  stage_b: "${output.root}/stage_b"
+  stage_c: "${output.root}/stage_c"
+  stage_d: "${output.root}/stage_d"
+  stage_e: "${output.root}/stage_e"
+  stage_f: "${output.root}/stage_f"
+
+one2scene:
+  root: "./third_party/One2Scene"
+  scaffold_ckpt: "./models/one2scene_scaffold.ckpt"
+  denoise_ckpt: "./models/one2scene_denoise.ckpt"
+
+# --- Stage B: Camera Trajectory ---
+trajectory:
+  n_rings: 5
+  rings:
+    - name: "horizon"
+      n_views: 24
+      elevation_deg: 0.0
+      radius: 0.5
+      look_inward: true
+    - name: "elevated"
+      n_views: 16
+      elevation_deg: 30.0
+      radius: 0.4
+      look_inward: true
+    - name: "depressed"
+      n_views: 16
+      elevation_deg: -20.0
+      radius: 0.4
+      look_inward: true
+    - name: "close_outward"
+      n_views: 20
+      elevation_deg: 0.0
+      radius: 0.3
+      look_inward: false
+    - name: "wide"
+      n_views: 16
+      elevation_deg: 10.0
+      radius: 1.0
+      look_inward: true
+  pole_views: 8   # 4 up + 4 down from cardinal positions
+  fov_deg: 70.0
+  image_width: 512
+  image_height: 512
+
+# --- Stage C: SEVA Denoise ---
+seva:
+  nproc_per_node: 1
+  batch_size: 1
+  n_target_views: 1
+  master_port: 21471
+
+# --- Stage D: Splat Optimization ---
+training:
+  iterations: 30000
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  position_lr_delay_mult: 0.01
+  position_lr_max_steps: 30000
+  feature_lr: 0.0025
+  opacity_lr: 0.05
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+  sh_degree: 3
+
+  # Densification
+  densify_from_iter: 500
+  densify_until_iter: 20000
+  densify_grad_threshold: 0.00005
+  densification_interval: 100
+
+  # Opacity reset
+  opacity_reset_interval: 3000
+  min_opacity: 0.005
+
+  # Loss weights
+  lambda_l1: 0.8
+  lambda_ssim: 0.2
+  lambda_depth: 0.1
+  depth_anneal_start: 0
+  depth_anneal_end: 15000
+
+  # Checkpointing
+  checkpoint_interval: 5000
+
+  # Safety
+  max_gaussians_warning: 3000000
+
+# --- Stage E: Upscale Refinement ---
+upscale:
+  sr_scale: 4
+  sr_model: "RealESRGAN_x4plus"
+  finetune_iterations: 10000
+  lr_scale: 0.1
+  densify_grad_threshold: 0.0002
+  lambda_depth: 0.05
+
+# --- Stage F: Export ---
+export:
+  target_engine: "unreal"    # unreal only (Z-up left-handed)
+  prune_opacity_threshold: 0.01
+  max_gaussians: 1500000

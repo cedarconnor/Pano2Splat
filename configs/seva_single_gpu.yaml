@@ -1,0 +1,13 @@
+# SEVA Single-GPU Overrides
+# Apply on top of One2Scene's seva_denoise_mostclosecamera.yaml
+# for running on a single A6000 (48GB).
+
+data:
+  params:
+    batch_size: 1
+    n_target_views: 1
+
+lightning:
+  trainer:
+    devices: 1
+    num_nodes: 1
