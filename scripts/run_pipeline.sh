@@ -9,19 +9,28 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
+source "$SCRIPT_DIR/common.sh"
 
 # --- Configuration ---
 PANO_INPUT="${PANO_INPUT:-./input/panorama.jpg}"
 WORK="${OUTPUT_ROOT:-./pipeline_output}"
+# Export so sub-scripts (run_stage_a.sh, run_stage_c.sh) use the same root
+export OUTPUT_ROOT="$WORK"
 ONE2SCENE="${PROJECT_ROOT}/third_party/One2Scene"
 CONFIG="${PROJECT_ROOT}/configs/pipeline.yaml"
 
-# Stage control: run all by default, or specify --stage X
-STAGE="${1:-all}"
+# Stage control: run all by default, or specify a stage as positional arg or --stage X
+STAGE="all"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --stage) STAGE="$2"; shift 2 ;;
+        --stage=*) STAGE="${1#*=}"; shift ;;
+        -*) echo "Unknown option: $1"; exit 1 ;;
+        *) STAGE="$1"; shift ;;
+    esac
+done
 
 # --- Helpers ---
-SECONDS=0
-
 log() {
     echo ""
     echo "================================================================"
@@ -31,7 +40,10 @@ log() {
 }
 
 elapsed() {
-    local t=$SECONDS
+    local start_time="$1"
+    local end_time
+    end_time=$(date +%s)
+    local t=$((end_time - start_time))
     printf "  Completed in %02d:%02d:%02d\n" $((t/3600)) $((t%3600/60)) $((t%60))
 }
 
@@ -60,12 +72,12 @@ if [ ! -f "$PANO_INPUT" ]; then
     exit 1
 fi
 
-TOTAL_START=$SECONDS
+TOTAL_START=$(date +%s)
 
-# ---- Stage A: Scaffold Generation ----
+# ---- Scaffold Generation ----
 run_stage_a() {
-    log "Stage A: Scaffold Generation (One2Scene)"
-    STAGE_START=$SECONDS
+    log "Scaffold Generation (One2Scene)"
+    STAGE_START=$(date +%s)
 
     bash scripts/run_stage_a.sh "$PANO_INPUT"
 
@@ -74,15 +86,13 @@ run_stage_a() {
     echo "  Stage A outputs:"
     ls -la "$WORK/stage_a/" 2>/dev/null || true
 
-    SECONDS=$((SECONDS - STAGE_START))
-    elapsed
-    SECONDS=$STAGE_START
+    elapsed "$STAGE_START"
 }
 
-# ---- Stage B: Camera Trajectory ----
+# ---- Camera Trajectory ----
 run_stage_b() {
-    log "Stage B: Camera Trajectory"
-    STAGE_START=$SECONDS
+    log "Camera Trajectory"
+    STAGE_START=$(date +%s)
 
     # One2Scene builds its own trajectory internally (stored in data.pth).
     # Stage A extraction saves these as target_cameras.json.
@@ -93,12 +103,12 @@ run_stage_b() {
         cp "$WORK/stage_a/target_cameras.json" "$WORK/stage_b/trajectory.json"
     else
         echo "  Generating custom 100-view trajectory"
-        python -m src.trajectory
+        run_project_python "$PROJECT_ROOT" -m src.trajectory
     fi
 
     # Validation
     check_file "$WORK/stage_b/trajectory.json"
-    POSE_COUNT=$(python -c "
+    POSE_COUNT=$(run_project_python "$PROJECT_ROOT" -c "
 import json
 with open('$WORK/stage_b/trajectory.json') as f:
     data = json.load(f)
@@ -107,15 +117,13 @@ print(len(poses))
 ")
     echo "  Trajectory: $POSE_COUNT views"
 
-    SECONDS=$((SECONDS - STAGE_START))
-    elapsed
-    SECONDS=$STAGE_START
+    elapsed "$STAGE_START"
 }
 
-# ---- Stage C: SEVA Denoise ----
+# ---- SEVA Denoise ----
 run_stage_c() {
-    log "Stage C: SEVA Denoise (sequential, single-GPU)"
-    STAGE_START=$SECONDS
+    log "SEVA Denoise (sequential, single-GPU)"
+    STAGE_START=$(date +%s)
 
     bash scripts/run_stage_c.sh
 
@@ -124,28 +132,26 @@ run_stage_c() {
     FRAME_COUNT=$(ls "$WORK/stage_c/denoised_frames/"*.png 2>/dev/null | wc -l)
     echo "  Denoised frames: $FRAME_COUNT"
     if [ "$FRAME_COUNT" -lt 10 ]; then
-        echo "WARNING: Only $FRAME_COUNT denoised frames found. Expected ~100."
+        echo "WARNING: Only $FRAME_COUNT denoised frames found. Expected 160 target frames."
     fi
 
     # Record resolution
     FIRST_FRAME=$(ls "$WORK/stage_c/denoised_frames/"*.png 2>/dev/null | head -1)
     if [ -n "$FIRST_FRAME" ]; then
-        python -c "
+        run_project_python "$PROJECT_ROOT" -c "
 from PIL import Image
 img = Image.open('$FIRST_FRAME')
 print(f'  SEVA output resolution: {img.size[0]}x{img.size[1]}')
 "
     fi
 
-    SECONDS=$((SECONDS - STAGE_START))
-    elapsed
-    SECONDS=$STAGE_START
+    elapsed "$STAGE_START"
 }
 
-# ---- Stage D: Splat Optimization ----
+# ---- Splat Optimization ----
 run_stage_d() {
-    log "Stage D: Splat Optimization (30K iterations)"
-    STAGE_START=$SECONDS
+    log "Splat Optimization (gsplat, multi-view batch training)"
+    STAGE_START=$(date +%s)
 
     # Use Stage C cameras if available, otherwise Stage B trajectory
     CAMERAS="$WORK/stage_b/trajectory.json"
@@ -153,24 +159,21 @@ run_stage_d() {
         CAMERAS="$WORK/stage_c/cameras.json"
     fi
 
-    python -m src.train_splat \
+    run_project_python_vs "$PROJECT_ROOT" -m src.train_splat \
         --scaffold_ply "$WORK/stage_a/scaffold_gaussians.ply" \
         --images "$WORK/stage_c/denoised_frames/" \
         --cameras "$CAMERAS" \
         --scaffold_depths "$WORK/stage_a/anchor_depths/" \
         --anchor_cameras "$WORK/stage_a/anchor_cameras/cameras.json" \
         --output "$WORK/stage_d/" \
-        --iterations 30000 \
-        --densify_grad_threshold 0.00005 \
-        --lambda_depth 0.1 \
-        --depth_anneal_end 15000
+        --config "$CONFIG"
 
     # Validation
     check_file "$WORK/stage_d/final.ply"
     check_file "$WORK/stage_d/metrics.json"
 
-    echo "  Stage D metrics:"
-    python -c "
+    echo "  Splat optimization metrics:"
+    run_project_python "$PROJECT_ROOT" -c "
 import json
 with open('$WORK/stage_d/metrics.json') as f:
     m = json.load(f)
@@ -183,89 +186,70 @@ if psnr < 25:
     print(f'    WARNING: PSNR {psnr:.1f} dB is below 25 dB target')
 "
 
-    SECONDS=$((SECONDS - STAGE_START))
-    elapsed
-    SECONDS=$STAGE_START
+    elapsed "$STAGE_START"
 }
 
-# ---- Stage E: Upscale Refinement ----
+# ---- Upscale Refinement ----
 run_stage_e() {
-    log "Stage E: Upscale Refinement (Real-ESRGAN 4x)"
-    STAGE_START=$SECONDS
+    log "Upscale Refinement (SeedVR2 4x)"
+    STAGE_START=$(date +%s)
 
     # Step 1: Render from trained splat
     echo "  [E.1] Rendering from trained splat..."
-    python -m src.render_splat \
+    run_project_python_vs "$PROJECT_ROOT" -m src.render_splat \
         --model_path "$WORK/stage_d/final.ply" \
         --cameras "$WORK/stage_d/training_cameras.json" \
         --output_dir "$WORK/stage_e/renders_native/"
 
-    # Step 2: Upscale with Real-ESRGAN
-    echo "  [E.2] Upscaling with Real-ESRGAN 4x..."
-    REALESRGAN_DIR="$ONE2SCENE/third_party/Real-ESRGAN"
-    if [ ! -d "$REALESRGAN_DIR" ]; then
-        echo "WARNING: Real-ESRGAN not found at $REALESRGAN_DIR"
-        echo "Skipping upscaling. Using native renders for fine-tuning."
-        cp -r "$WORK/stage_e/renders_native/" "$WORK/stage_e/renders_upscaled/"
-    else
-        mkdir -p "$WORK/stage_e/renders_upscaled"
-        python "$REALESRGAN_DIR/inference_realesrgan.py" \
-            -i "$WORK/stage_e/renders_native/" \
-            -o "$WORK/stage_e/renders_upscaled/" \
-            -n RealESRGAN_x4plus \
-            -s 4
-    fi
+    # Step 2: Upscale with SeedVR2 (temporal consistency via one-step diffusion)
+    echo "  [E.2] Upscaling with SeedVR2 4x..."
+    PYTHONIOENCODING=utf-8 run_project_python "$PROJECT_ROOT" -m src.upscale \
+        --input "$WORK/stage_e/renders_native/" \
+        --output "$WORK/stage_e/renders_upscaled/" \
+        --target_resolution 2048 \
+        --no_video_mode
 
     # Step 3: Fine-tune splat against upscaled images
     echo "  [E.3] Fine-tuning splat against upscaled frames..."
-    python -m src.train_splat \
+    run_project_python_vs "$PROJECT_ROOT" -m src.train_splat \
         --init_ply "$WORK/stage_d/final.ply" \
         --images "$WORK/stage_e/renders_upscaled/" \
         --cameras "$WORK/stage_d/training_cameras.json" \
         --scaffold_depths "$WORK/stage_a/anchor_depths/" \
         --anchor_cameras "$WORK/stage_a/anchor_cameras/cameras.json" \
         --output "$WORK/stage_e/" \
-        --iterations 10000 \
-        --lr_scale 0.1 \
-        --densify_grad_threshold 0.0002 \
-        --lambda_depth 0.05
+        --config "$CONFIG"
 
     # Validation
     check_file "$WORK/stage_e/final.ply"
-    echo "  Stage E complete. Compare refined vs Stage D output visually."
+    echo "  Upscale refinement complete. Compare refined vs base splat output visually."
 
-    SECONDS=$((SECONDS - STAGE_START))
-    elapsed
-    SECONDS=$STAGE_START
+    elapsed "$STAGE_START"
 }
 
-# ---- Stage F: Export ----
+# ---- Export ----
 run_stage_f() {
-    log "Stage F: Export & Compression"
-    STAGE_START=$SECONDS
+    log "Export & Compression"
+    STAGE_START=$(date +%s)
 
     # Use Stage E output if available, otherwise Stage D
     if [ -f "$WORK/stage_e/final.ply" ]; then
         INPUT_PLY="$WORK/stage_e/final.ply"
-        echo "  Using Stage E refined splat"
+        echo "  Using upscale-refined splat"
     else
         INPUT_PLY="$WORK/stage_d/final.ply"
-        echo "  Using Stage D splat (Stage E not available)"
+        echo "  Using base splat (upscale refinement not available)"
     fi
 
-    python -m src.export_splat \
+    run_project_python "$PROJECT_ROOT" -m src.export_splat \
         --input "$INPUT_PLY" \
         --output "$WORK/stage_f/final_export.ply" \
-        --prune_opacity 0.01 \
-        --max_gaussians 1500000 \
-        --target_engine unreal
+        --config "$CONFIG"
 
     # Validation
     check_file "$WORK/stage_f/final_export.ply"
 
-    SECONDS=$((SECONDS - STAGE_START))
-    elapsed
-    SECONDS=$STAGE_START
+    elapsed "$STAGE_START"
 }
 
 # ---- Dispatch ----
@@ -278,21 +262,22 @@ case "$STAGE" in
         run_stage_e
         run_stage_f
         ;;
-    a|A) run_stage_a ;;
-    b|B) run_stage_b ;;
-    c|C) run_stage_c ;;
-    d|D) run_stage_d ;;
-    e|E) run_stage_e ;;
-    f|F) run_stage_f ;;
+    a|A|scaffold)   run_stage_a ;;
+    b|B|trajectory) run_stage_b ;;
+    c|C|denoise)    run_stage_c ;;
+    d|D|train)      run_stage_d ;;
+    e|E|upscale)    run_stage_e ;;
+    f|F|export)     run_stage_f ;;
     *)
         echo "Usage: $0 [stage]"
-        echo "  stage: a, b, c, d, e, f, or all (default)"
+        echo "  stage: scaffold, trajectory, denoise, train, upscale, export, or all (default)"
+        echo "  (also accepts: a, b, c, d, e, f)"
         exit 1
         ;;
 esac
 
 # ---- Summary ----
-TOTAL_ELAPSED=$((SECONDS - TOTAL_START))
+TOTAL_ELAPSED=$(( $(date +%s) - TOTAL_START ))
 log "Pipeline Complete"
 printf "  Total time: %02d:%02d:%02d\n" $((TOTAL_ELAPSED/3600)) $((TOTAL_ELAPSED%3600/60)) $((TOTAL_ELAPSED%60))
 

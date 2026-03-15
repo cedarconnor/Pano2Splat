@@ -12,12 +12,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 ONE2SCENE_DIR="$PROJECT_ROOT/third_party/One2Scene"
+source "$SCRIPT_DIR/common.sh"
 
 # Input panorama (default: ./input/panorama.jpg)
 INPUT_PANO="${1:-$PROJECT_ROOT/input/panorama.jpg}"
 
-# Output directory
-STAGE_A_OUT="$PROJECT_ROOT/pipeline_output/stage_a"
+# Output directory (respects OUTPUT_ROOT env var from run_pipeline.sh)
+STAGE_A_OUT="${OUTPUT_ROOT:-$PROJECT_ROOT/pipeline_output}/stage_a"
 
 # Model checkpoint
 SCAFFOLD_CKPT="$PROJECT_ROOT/models/one2scene_scaffold.ckpt"
@@ -88,7 +89,7 @@ export PYTHONPATH="$ONE2SCENE_DIR${PYTHONPATH:+:$PYTHONPATH}"
 WIN_STAGE_A_OUT=$(cygpath -w "$STAGE_A_OUT" 2>/dev/null || echo "$STAGE_A_OUT")
 WIN_SCAFFOLD_CKPT=$(cygpath -w "$SCAFFOLD_CKPT" 2>/dev/null || echo "$SCAFFOLD_CKPT")
 
-python src/main.py \
+run_project_python "$PROJECT_ROOT" src/main.py \
     +experiment=demo \
     mode=test \
     test.output_path="$WIN_STAGE_A_OUT/raw" \
@@ -161,12 +162,12 @@ fi
 echo ""
 echo "[4/4] Extracting scaffold data..."
 
-EXTRACT_ARGS="--output_dir $STAGE_A_OUT"
+EXTRACT_ARGS=(--output_dir "$STAGE_A_OUT")
 
 if [ -f "$STAGE_A_OUT/data.pth" ]; then
-    EXTRACT_ARGS="$EXTRACT_ARGS --data_pth $STAGE_A_OUT/data.pth"
+    EXTRACT_ARGS+=(--data_pth "$STAGE_A_OUT/data.pth")
 elif [ -n "$DATA_PTH" ] && [ -f "$DATA_PTH" ]; then
-    EXTRACT_ARGS="$EXTRACT_ARGS --data_pth $DATA_PTH"
+    EXTRACT_ARGS+=(--data_pth "$DATA_PTH")
 else
     echo "[ERROR] Cannot find data.pth from Stage A output."
     echo "  Discovery log: $DISCOVERY_LOG"
@@ -174,11 +175,11 @@ else
 fi
 
 if [ -n "$FUSED_PLY" ] && [ -f "$FUSED_PLY" ]; then
-    EXTRACT_ARGS="$EXTRACT_ARGS --fused_ply $FUSED_PLY"
+    EXTRACT_ARGS+=(--fused_ply "$FUSED_PLY")
 fi
 
 cd "$PROJECT_ROOT"
-python -m src.extract_scaffold $EXTRACT_ARGS
+run_project_python_vs "$PROJECT_ROOT" -m src.extract_scaffold "${EXTRACT_ARGS[@]}"
 
 # ---------------------------------------------------------------------------
 # Verification

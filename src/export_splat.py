@@ -7,9 +7,11 @@ compressed .ply file suitable for real-time rendering.
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 from src.utils.ply_io import load_ply, save_ply
 
@@ -31,6 +33,13 @@ def prune_by_volume(gaussians: dict, threshold: float = 1e-10) -> dict:
     scales_activated = np.exp(gaussians["scales"])  # (N, 3)
     volume = np.prod(scales_activated, axis=1)      # (N,)
     mask = volume >= threshold
+    return _apply_mask(gaussians, mask), int((~mask).sum())
+
+
+def prune_by_max_scale(gaussians: dict, max_scale: float = 1.0) -> dict:
+    """Remove Gaussians where any activated scale dimension exceeds max_scale."""
+    scales_activated = np.exp(gaussians["scales"])  # (N, 3)
+    mask = np.all(scales_activated <= max_scale, axis=1)
     return _apply_mask(gaussians, mask), int((~mask).sum())
 
 
@@ -140,7 +149,45 @@ def _apply_mask(gaussians: dict, mask: np.ndarray) -> dict:
     return {key: arr[mask] for key, arr in gaussians.items()}
 
 
-def main() -> None:
+def _cli_flags(argv: list[str]) -> set[str]:
+    flags = set()
+    for arg in argv:
+        if arg.startswith("--"):
+            flags.add(arg.split("=", 1)[0])
+    return flags
+
+
+def _maybe_apply_config(args: argparse.Namespace, cli_flags: set[str], name: str, value) -> None:
+    if value is None:
+        return
+    if f"--{name}" in cli_flags:
+        return
+    setattr(args, name.replace("-", "_"), value)
+
+
+def apply_config_defaults(args: argparse.Namespace, cli_flags: set[str]) -> argparse.Namespace:
+    if not args.config:
+        return args
+
+    with open(args.config, "r") as f:
+        config = yaml.safe_load(f) or {}
+
+    export_cfg = config.get("export", {})
+    overlay = {
+        "prune_opacity": export_cfg.get("prune_opacity_threshold"),
+        "max_gaussians": export_cfg.get("max_gaussians"),
+        "target_engine": export_cfg.get("target_engine"),
+    }
+    for name, value in overlay.items():
+        _maybe_apply_config(args, cli_flags, name, value)
+
+    return args
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    if argv is None:
+        argv = sys.argv[1:]
+
     parser = argparse.ArgumentParser(
         description="Export engine-ready .ply with pruning and coordinate transforms."
     )
@@ -154,8 +201,16 @@ def main() -> None:
         help="Output .ply path",
     )
     parser.add_argument(
+        "--config", type=str, default=None,
+        help="Optional pipeline.yaml path for export defaults",
+    )
+    parser.add_argument(
         "--prune_opacity", type=float, default=0.01,
         help="Opacity threshold for pruning (default 0.01)",
+    )
+    parser.add_argument(
+        "--max_scale", type=float, default=1.0,
+        help="Prune Gaussians with any exp(scale) > this (default 1.0)",
     )
     parser.add_argument(
         "--max_gaussians", type=int, default=1_500_000,
@@ -163,14 +218,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--target_engine", type=str, default="unreal",
-        choices=["unreal"],
-        help="Target engine for coordinate transform (default: unreal)",
+        choices=["unreal", "none"],
+        help="Target engine for coordinate transform (default: unreal, none=skip)",
     )
     parser.add_argument(
         "--world_scale", type=float, default=1.0,
         help="Uniform scale factor for real-world units (default 1.0)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    return apply_config_defaults(args, _cli_flags(argv))
+
+
+def main() -> None:
+    args = parse_args()
 
     # Load input
     input_path = Path(args.input)
@@ -185,6 +245,12 @@ def main() -> None:
     if n_opacity > 0:
         print(f"  Pruned {n_opacity:,} low-opacity Gaussians "
               f"(sigmoid < {args.prune_opacity})")
+
+    # Prune extreme scales
+    gaussians, n_scale = prune_by_max_scale(gaussians, args.max_scale)
+    if n_scale > 0:
+        print(f"  Pruned {n_scale:,} extreme-scale Gaussians "
+              f"(exp(scale) > {args.max_scale})")
 
     # Prune small volume
     gaussians, n_volume = prune_by_volume(gaussians, threshold=1e-10)

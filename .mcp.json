@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "lichtfeld": {
+      "command": "python",
+      "args": ["D:/Pano2Splat/LichtFeld-Studio-windows-nightly-2026-02-03-5a92bff/lichtfeld_mcp_bridge.py"],
+      "env": {
+        "LICHTFELD_EXECUTABLE": "D:/Pano2Splat/LichtFeld-Studio-windows-nightly-2026-02-03-5a92bff/bin/LichtFeld-Studio.exe"
+      }
+    }
+  }
+}

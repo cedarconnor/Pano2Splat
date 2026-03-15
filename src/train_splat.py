@@ -31,6 +31,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -38,6 +39,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 from gsplat import rasterization
 from pytorch_msssim import ssim as ssim_fn
 
@@ -97,12 +99,15 @@ class GaussianModel(nn.Module):
             n = max_init_points
         sh_rest = torch.tensor(data["sh_rest"], dtype=torch.float32, device=device)
 
-        # Expand SH rest if we need higher degree than what's in the PLY
+        # Match SH rest to requested degree: expand if too few, truncate if too many
         n_rest_needed = ((sh_degree + 1) ** 2 - 1) * 3
         n_rest_have = sh_rest.shape[1]
         if n_rest_needed > n_rest_have:
             padding = torch.zeros(n, n_rest_needed - n_rest_have, dtype=torch.float32, device=device)
             sh_rest = torch.cat([sh_rest, padding], dim=1)
+        elif n_rest_needed < n_rest_have:
+            print(f"  Truncating SH rest: {n_rest_have} -> {n_rest_needed} (degree {sh_degree})")
+            sh_rest = sh_rest[:, :n_rest_needed]
 
         return cls(
             positions=torch.tensor(data["positions"], dtype=torch.float32, device=device),
@@ -297,13 +302,15 @@ def render_gaussians(
     max_degree_from_data = int(math.sqrt(n_sh_coeffs)) - 1
     effective_degree = min(sh_degree, max_degree_from_data)
 
-    # Build colors tensor: (N, n_sh_coeffs, 3)
+    # Build colors tensor: (N, K, 3) where K = (effective_degree+1)^2
+    # Truncate to effective_degree to avoid wasting memory when data has more SH
+    # coefficients than needed (e.g. scaffold with degree 4, training with degree 3).
+    n_coeffs_needed = (effective_degree + 1) ** 2  # 16 for degree 3
     sh_dc_expanded = model.sh_dc.unsqueeze(1)  # (N, 1, 3)
     if n_sh_rest_total > 0:
-        # sh_rest is stored flat: (N, n_rest_per_channel * 3)
-        # Reshape to (N, n_rest_per_channel, 3)
         sh_rest_3d = model.sh_rest.reshape(n, n_sh_rest_per_channel, 3)
-        colors = torch.cat([sh_dc_expanded, sh_rest_3d], dim=1)  # (N, K, 3)
+        colors = torch.cat([sh_dc_expanded, sh_rest_3d], dim=1)  # (N, K_full, 3)
+        colors = colors[:, :n_coeffs_needed, :]  # truncate to effective degree
     else:
         colors = sh_dc_expanded  # (N, 1, 3)
 
@@ -505,6 +512,8 @@ def load_images(image_dir: str, device: str) -> list[torch.Tensor]:
     """Load all images from a directory as (C, H, W) float tensors in [0, 1].
 
     Images are sorted by filename to ensure consistent ordering with cameras.
+    For high-res images (>512px), keeps tensors on CPU to save VRAM.
+    Use .to(device) per-iteration in the training loop.
     """
     from PIL import Image
     from torchvision import transforms
@@ -520,13 +529,26 @@ def load_images(image_dir: str, device: str) -> list[torch.Tensor]:
         raise FileNotFoundError(f"No images found in {image_dir}")
 
     to_tensor = transforms.ToTensor()  # converts to (C, H, W) in [0, 1]
+
+    # Peek at first image to decide storage location
+    first = Image.open(image_paths[0]).convert("RGB")
+    first_t = to_tensor(first)
+    h, w = first_t.shape[1], first_t.shape[2]
+
+    # Keep on CPU if high-res to save VRAM (transferred per-iteration)
+    storage = "cpu" if max(h, w) > 512 else device
+    if storage == "cpu" and device != "cpu":
+        n_images = len(image_paths)
+        mem_gb = n_images * 3 * h * w * 4 / (1024**3)
+        print(f"  High-res images ({w}x{h}): keeping on CPU to save ~{mem_gb:.1f} GB VRAM")
+
     images = []
     for p in image_paths:
         img = Image.open(p).convert("RGB")
-        images.append(to_tensor(img).to(device))
+        images.append(to_tensor(img).to(storage))
 
     print(f"Loaded {len(images)} images from {image_dir} "
-          f"(resolution: {images[0].shape[1]}x{images[0].shape[2]})")
+          f"(resolution: {images[0].shape[2]}x{images[0].shape[1]}, storage: {storage})")
     return images
 
 
@@ -562,11 +584,17 @@ def find_depth_for_view(
     training_cameras: list[dict],
     scaffold_depths: dict[int, np.ndarray],
     cos_threshold: float = 0.95,
+    position_threshold: float = 5.0,
 ) -> int | None:
     """Find the anchor depth map closest to a training view.
 
-    Matches by comparing camera forward directions. Returns the anchor camera
-    ID if the cosine similarity exceeds cos_threshold, else None.
+    Matches primarily by forward direction similarity, with a loose position
+    check.  When anchors are all at the origin (panorama decomposition) and
+    training cameras are translated outward, depth maps are still useful as
+    regularization targets even though the viewpoint is shifted.
+
+    Returns the anchor camera ID if both direction and position thresholds
+    are met, else None.
     """
     if not scaffold_depths or not anchor_cameras:
         return None
@@ -576,9 +604,13 @@ def find_depth_for_view(
     # Camera forward direction is the third row of rotation (negated for OpenGL)
     train_fwd = -train_ext[2, :3]
     train_fwd = train_fwd / np.linalg.norm(train_fwd)
+    # Camera position: C = -R^T @ t
+    train_R = train_ext[:3, :3]
+    train_t = train_ext[:3, 3]
+    train_pos = -train_R.T @ train_t
 
     best_id = None
-    best_cos = -1.0
+    best_score = -1.0
 
     for acam in anchor_cameras:
         if acam["id"] not in scaffold_depths:
@@ -586,14 +618,21 @@ def find_depth_for_view(
         a_ext = np.array(acam["extrinsic"])
         a_fwd = -a_ext[2, :3]
         a_fwd = a_fwd / np.linalg.norm(a_fwd)
-        cos_sim = float(np.dot(train_fwd, a_fwd))
-        if cos_sim > best_cos:
-            best_cos = cos_sim
-            best_id = acam["id"]
+        a_R = a_ext[:3, :3]
+        a_t = a_ext[:3, 3]
+        a_pos = -a_R.T @ a_t
 
-    if best_cos >= cos_threshold and best_id is not None:
-        return best_id
-    return None
+        cos_sim = float(np.dot(train_fwd, a_fwd))
+        pos_dist = float(np.linalg.norm(train_pos - a_pos))
+
+        # Both direction and position must be close
+        if cos_sim >= cos_threshold and pos_dist <= position_threshold:
+            score = cos_sim - pos_dist  # prefer closer position at same direction
+            if score > best_score:
+                best_score = score
+                best_id = acam["id"]
+
+    return best_id
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +653,7 @@ def evaluate_metrics(
     lpips_sum = 0.0
 
     for idx in range(len(images)):
-        gt = images[idx]
+        gt = images[idx].to(device)  # may transfer from CPU
         cam = cameras[idx]
         viewmat = torch.tensor(cam["extrinsic"], dtype=torch.float32, device=device)
         K = torch.tensor(cam["intrinsic"], dtype=torch.float32, device=device)
@@ -637,6 +676,29 @@ def evaluate_metrics(
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _quick_val_psnr(
+    model: GaussianModel,
+    images: list[torch.Tensor],
+    cameras: list[dict],
+    val_indices: list[int],
+    sh_degree: int,
+    device: str,
+) -> float:
+    """Compute average PSNR on validation views (fast, no LPIPS)."""
+    psnr_sum = 0.0
+    for idx in val_indices:
+        gt = images[idx].to(device)
+        cam = cameras[idx]
+        viewmat = torch.tensor(cam["extrinsic"], dtype=torch.float32, device=device)
+        K = torch.tensor(cam["intrinsic"], dtype=torch.float32, device=device)
+        w, h = cam["width"], cam["height"]
+        rendered, _, _ = render_gaussians(model, viewmat, K, w, h, sh_degree)
+        mse = F.mse_loss(rendered, gt)
+        psnr_sum += (-10.0 * torch.log10(mse.clamp(min=1e-10))).item()
+    return psnr_sum / max(len(val_indices), 1)
+
 
 def train(args):
     """Main training loop."""
@@ -667,6 +729,16 @@ def train(args):
             f"({len(cameras)}). Check --images and --cameras paths."
         )
 
+    # Auto-scale camera resolution to match images (for Stage E fine-tuning)
+    img_h, img_w = images[0].shape[1], images[0].shape[2]
+    cam_w, cam_h = cameras[0]["width"], cameras[0]["height"]
+    if img_w != cam_w or img_h != cam_h:
+        print(f"  Resolution mismatch: images {img_w}x{img_h} vs cameras {cam_w}x{cam_h}")
+        print(f"  Auto-scaling camera width/height to match images")
+        for cam in cameras:
+            cam["width"] = img_w
+            cam["height"] = img_h
+
     # ---- Load scaffold depths for regularization --------------------------
     scaffold_depths = {}
     anchor_cameras = []
@@ -694,6 +766,19 @@ def train(args):
         )
         print(f"Global depth scale: {global_scale:.4f}")
 
+    # ---- Train/val split for early stopping ---------------------------------
+    all_indices = list(range(len(images)))
+    if args.early_stopping and args.val_fraction > 0:
+        rng = random.Random(42)
+        n_val = max(1, int(len(images) * args.val_fraction))
+        val_indices = sorted(rng.sample(all_indices, n_val))
+        train_indices = sorted(set(all_indices) - set(val_indices))
+        print(f"Early stopping: {len(train_indices)} train / {len(val_indices)} val views "
+              f"(patience={args.patience_iters} iters)")
+    else:
+        train_indices = all_indices
+        val_indices = []
+
     # ---- Build optimizer ---------------------------------------------------
     optimizer = build_optimizer(model, args)
 
@@ -706,90 +791,139 @@ def train(args):
     for k, v in scaffold_depths.items():
         scaffold_depths_gpu[k] = torch.tensor(v, dtype=torch.float32, device=device)
 
+    # ---- Mixed precision setup ---------------------------------------------
+    use_amp = args.mixed_precision and device == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
     # ---- Training loop -----------------------------------------------------
+    batch_views = max(1, args.batch_views)
     print(f"\nStarting training: {args.iterations} iterations")
+    print(f"  Batch views: {batch_views} per iteration")
     print(f"  L1 weight: {args.lambda_l1}, SSIM weight: {args.lambda_ssim}")
     print(f"  Depth weight: {args.lambda_depth} (anneal {args.depth_anneal_start}-{args.depth_anneal_end})")
     print(f"  Densify: iter {args.densify_from_iter}-{args.densify_until_iter}, "
           f"threshold={args.densify_grad_threshold}, interval={args.densification_interval}")
     print(f"  LR scale: {args.lr_scale}")
+    if use_amp:
+        print(f"  Mixed precision: enabled (FP16 rendering, FP32 gradients)")
     print()
 
     start_time = time.time()
     best_loss = float("inf")
 
+    # Early stopping state
+    best_val_psnr = -1.0
+    best_val_iter = 0
+    stopped_early = False
+
     for iteration in range(1, args.iterations + 1):
-        # 1. Sample random training view
-        idx = random.randint(0, len(images) - 1)
-        gt_image = images[idx]  # (3, H, W)
-        cam = cameras[idx]
+        # 1. Sample random training views (multi-view batch)
+        batch_indices = random.choices(train_indices, k=batch_views)
 
-        viewmat = torch.tensor(cam["extrinsic"], dtype=torch.float32, device=device)
-        K = torch.tensor(cam["intrinsic"], dtype=torch.float32, device=device)
-        w, h = cam["width"], cam["height"]
+        total_loss = torch.tensor(0.0, device=device)
+        total_l1 = 0.0
+        total_ssim_loss = 0.0
+        all_infos = []
 
-        # 2. Render
-        rendered_image, rendered_depth, info = render_gaussians(
-            model, viewmat, K, w, h, args.sh_degree
-        )
+        for idx in batch_indices:
+            gt_image = images[idx].to(device)  # (3, H, W)
+            cam = cameras[idx]
 
-        # 3. Compute loss
-        l1_loss = F.l1_loss(rendered_image, gt_image)
-        ssim_val = ssim_fn(
-            rendered_image.unsqueeze(0),
-            gt_image.unsqueeze(0),
-            data_range=1.0,
-            size_average=True,
-        )
-        ssim_loss = 1.0 - ssim_val
-        loss = args.lambda_l1 * l1_loss + args.lambda_ssim * ssim_loss
+            viewmat = torch.tensor(cam["extrinsic"], dtype=torch.float32, device=device)
+            K = torch.tensor(cam["intrinsic"], dtype=torch.float32, device=device)
+            w, h = cam["width"], cam["height"]
 
-        # Depth regularization (annealed)
-        if (
-            idx in view_depth_map
-            and iteration < args.depth_anneal_end
-            and args.lambda_depth > 0
-        ):
-            anchor_id = view_depth_map[idx]
-            sd = scaffold_depths_gpu[anchor_id]
+            # 2. Render (with optional mixed precision)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                rendered_image, rendered_depth, info = render_gaussians(
+                    model, viewmat, K, w, h, args.sh_degree
+                )
 
-            anneal_range = args.depth_anneal_end - args.depth_anneal_start
-            if anneal_range > 0:
-                progress = max(0, iteration - args.depth_anneal_start) / anneal_range
-                anneal_factor = 1.0 - min(progress, 1.0)
-            else:
-                anneal_factor = 1.0
+                # 3. Compute loss
+                l1_loss = F.l1_loss(rendered_image, gt_image)
+                ssim_val = ssim_fn(
+                    rendered_image.unsqueeze(0),
+                    gt_image.unsqueeze(0),
+                    data_range=1.0,
+                    size_average=True,
+                )
+                ssim_loss = 1.0 - ssim_val
+                view_loss = args.lambda_l1 * l1_loss + args.lambda_ssim * ssim_loss
 
-            d_loss = depth_loss_fn(rendered_depth, sd, global_scale)
-            loss = loss + args.lambda_depth * anneal_factor * d_loss
+                # Depth regularization (annealed)
+                if (
+                    idx in view_depth_map
+                    and iteration < args.depth_anneal_end
+                    and args.lambda_depth > 0
+                ):
+                    anchor_id = view_depth_map[idx]
+                    sd = scaffold_depths_gpu[anchor_id]
+
+                    anneal_range = args.depth_anneal_end - args.depth_anneal_start
+                    if anneal_range > 0:
+                        progress = max(0, iteration - args.depth_anneal_start) / anneal_range
+                        anneal_factor = 1.0 - min(progress, 1.0)
+                    else:
+                        anneal_factor = 1.0
+
+                    d_loss = depth_loss_fn(rendered_depth, sd, global_scale)
+                    view_loss = view_loss + args.lambda_depth * anneal_factor * d_loss
+
+            total_loss = total_loss + view_loss / batch_views
+            total_l1 += l1_loss.item() / batch_views
+            total_ssim_loss += ssim_loss.item() / batch_views
+            all_infos.append((info, w, h))
 
         # 4. Retain grad on means2d for densification, then backward
         in_densify_range = (
             args.densify_from_iter <= iteration <= args.densify_until_iter
         )
-        if in_densify_range and "means2d" in info:
-            info["means2d"].retain_grad()
-        loss.backward()
+        if in_densify_range:
+            for info, _, _ in all_infos:
+                if "means2d" in info:
+                    info["means2d"].retain_grad()
+
+        scaler.scale(total_loss).backward()
 
         # 5. Accumulate viewspace gradients for densification
-        if in_densify_range and "means2d" in info:
-            means2d = info["means2d"]  # (1, N, 2) or (N, 2)
-            if means2d.grad is not None:
-                g = means2d.grad
+        if in_densify_range:
+            for info, vw, vh in all_infos:
+                if "means2d" not in info:
+                    continue
+                means2d = info["means2d"]
+                if means2d.grad is None:
+                    continue
+                g = means2d.grad.detach()
                 if g.ndim == 3:
-                    g = g.squeeze(0)  # (N, 2)
-                # Handle size mismatch after previous densification
-                n_current = model.n_gaussians
-                if g.shape[0] == n_current:
-                    grad_accum[:n_current] += g.detach()
-                    grad_count[:n_current] += 1
+                    g = g.squeeze(0)
 
-        # 6. Optimizer step
-        optimizer.step()
+                # Normalize to screen space (matching gsplat convention)
+                g = g.clone()
+                g[..., 0] *= vw / 2.0
+                g[..., 1] *= vh / 2.0
+
+                if "gaussian_ids" in info:
+                    gs_ids = info["gaussian_ids"]
+                    grad_accum.index_add_(0, gs_ids, g)
+                    grad_count.index_add_(
+                        0, gs_ids,
+                        torch.ones(gs_ids.shape[0], device=device),
+                    )
+                else:
+                    n_current = model.n_gaussians
+                    if g.shape[0] == n_current:
+                        grad_accum[:n_current] += g
+                        grad_count[:n_current] += 1
+
+        # 6. Optimizer step (with grad scaler for mixed precision)
+        scaler.step(optimizer)
+        scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-        # 7. Densification
-        if in_densify_range and iteration % args.densification_interval == 0:
+        # 7. Densification (skip if already above safety cap — WDDM needs headroom)
+        if (in_densify_range
+                and iteration % args.densification_interval == 0
+                and model.n_gaussians < 1_000_000):
             model.densify_and_prune(
                 grad_accum,
                 grad_count,
@@ -804,15 +938,16 @@ def train(args):
             # Re-apply current LR schedule for position
             update_learning_rate(optimizer, iteration, args)
 
-        # 8. Opacity reset
-        if iteration % args.opacity_reset_interval == 0:
+        # 8. Opacity reset (skip if this is the final iteration)
+        if (iteration % args.opacity_reset_interval == 0
+                and iteration < args.iterations):
             model.reset_opacities()
 
         # 9. Learning rate scheduling
         update_learning_rate(optimizer, iteration, args)
 
         # 10. Logging
-        cur_loss = loss.item()
+        cur_loss = total_loss.item()
         if cur_loss < best_loss:
             best_loss = cur_loss
 
@@ -820,8 +955,8 @@ def train(args):
             elapsed = time.time() - start_time
             print(
                 f"[Iter {iteration:>6d}/{args.iterations}] "
-                f"Loss: {cur_loss:.4f}  L1: {l1_loss.item():.4f}  "
-                f"SSIM: {ssim_loss.item():.4f}  "
+                f"Loss: {cur_loss:.4f}  L1: {total_l1:.4f}  "
+                f"SSIM: {total_ssim_loss:.4f}  "
                 f"Gaussians: {model.n_gaussians:,}  "
                 f"Time: {elapsed:.0f}s"
             )
@@ -840,9 +975,39 @@ def train(args):
             model.to_ply(ckpt_path)
             print(f"  Saved checkpoint: {ckpt_path}")
 
+        # 13. Early stopping: evaluate on validation views periodically
+        if val_indices and iteration % 500 == 0:
+            val_psnr = _quick_val_psnr(model, images, cameras, val_indices,
+                                       args.sh_degree, device)
+            if val_psnr > best_val_psnr:
+                best_val_psnr = val_psnr
+                best_val_iter = iteration
+                # Save best model
+                best_path = os.path.join(args.output, "best.ply")
+                model.to_ply(best_path)
+            elif iteration - best_val_iter >= args.patience_iters:
+                print(f"\n  Early stopping at iter {iteration}: val PSNR {val_psnr:.2f} dB "
+                      f"(best {best_val_psnr:.2f} dB at iter {best_val_iter})")
+                stopped_early = True
+                break
+
+            if iteration % 1000 == 0:
+                print(f"  Val PSNR: {val_psnr:.2f} dB "
+                      f"(best: {best_val_psnr:.2f} dB @ iter {best_val_iter})")
+
     # ---- Finalize ----------------------------------------------------------
     total_time = time.time() - start_time
+    actual_iters = iteration if stopped_early else args.iterations
     print(f"\nTraining complete in {total_time:.1f}s ({total_time / 60:.1f} min)")
+    if stopped_early:
+        print(f"  Early stopped at iteration {actual_iters}/{args.iterations}")
+
+    # If early stopped and we have a best model, use it
+    best_path = os.path.join(args.output, "best.ply")
+    if stopped_early and os.path.exists(best_path):
+        print(f"  Loading best model from iter {best_val_iter} (val PSNR {best_val_psnr:.2f} dB)")
+        model = GaussianModel.from_ply(best_path, device=device, sh_degree=args.sh_degree)
+
     print(f"Final Gaussian count: {model.n_gaussians:,}")
 
     # Save final model
@@ -860,7 +1025,14 @@ def train(args):
     metrics = evaluate_metrics(model, images, cameras, args.sh_degree, device)
     metrics["n_gaussians"] = model.n_gaussians
     metrics["training_time_sec"] = total_time
-    metrics["iterations"] = args.iterations
+    metrics["iterations"] = actual_iters
+    metrics["max_iterations"] = args.iterations
+    metrics["batch_views"] = batch_views
+    metrics["mixed_precision"] = use_amp
+    if stopped_early:
+        metrics["early_stopped"] = True
+        metrics["best_val_psnr"] = best_val_psnr
+        metrics["best_val_iter"] = best_val_iter
 
     metrics_path = os.path.join(args.output, "metrics.json")
     with open(metrics_path, "w") as f:
@@ -879,7 +1051,93 @@ def train(args):
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
+def _cli_flags(argv: list[str]) -> set[str]:
+    """Return the set of CLI option names explicitly present in argv.
+
+    Handles BooleanOptionalAction: --no-foo is treated as explicit --foo.
+    """
+    flags = set()
+    for arg in argv:
+        if not arg.startswith("--"):
+            continue
+        name = arg.split("=", 1)[0]
+        flags.add(name)
+        # --no-foo means --foo was explicitly set
+        if name.startswith("--no-"):
+            flags.add("--" + name[5:])
+    return flags
+
+
+def _maybe_apply_config(args: argparse.Namespace, cli_flags: set[str], name: str, value) -> None:
+    """Apply a config value unless the user already set the flag explicitly."""
+    if value is None:
+        return
+    if f"--{name}" in cli_flags:
+        return
+    setattr(args, name.replace("-", "_"), value)
+
+
+def apply_config_defaults(args: argparse.Namespace, cli_flags: set[str]) -> argparse.Namespace:
+    """Overlay defaults from pipeline.yaml onto parsed CLI args."""
+    if not args.config:
+        return args
+
+    with open(args.config, "r") as f:
+        config = yaml.safe_load(f) or {}
+
+    training_cfg = config.get("training", {})
+    for name in [
+        "iterations",
+        "position_lr_init",
+        "position_lr_final",
+        "position_lr_delay_mult",
+        "position_lr_max_steps",
+        "feature_lr",
+        "opacity_lr",
+        "scaling_lr",
+        "rotation_lr",
+        "sh_degree",
+        "densify_from_iter",
+        "densify_until_iter",
+        "densify_grad_threshold",
+        "densification_interval",
+        "opacity_reset_interval",
+        "min_opacity",
+        "lambda_l1",
+        "lambda_ssim",
+        "lambda_depth",
+        "depth_anneal_start",
+        "depth_anneal_end",
+        "checkpoint_interval",
+        "max_init_points",
+        "batch_views",
+        "early_stopping",
+        "val_fraction",
+        "patience_iters",
+        "mixed_precision",
+    ]:
+        _maybe_apply_config(args, cli_flags, name, training_cfg.get(name))
+
+    # Stage E fine-tune mode overlays a few training defaults with the upscale section.
+    if args.init_ply:
+        upscale_cfg = config.get("upscale", {})
+        overlay = {
+            "iterations": upscale_cfg.get("finetune_iterations"),
+            "lr_scale": upscale_cfg.get("lr_scale"),
+            "densify_grad_threshold": upscale_cfg.get("densify_grad_threshold"),
+            "lambda_depth": upscale_cfg.get("lambda_depth"),
+            "opacity_reset_interval": upscale_cfg.get("opacity_reset_interval"),
+        }
+        for name, value in overlay.items():
+            _maybe_apply_config(args, cli_flags, name, value)
+
+    return args
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    if argv is None:
+        argv = sys.argv[1:]
+
     parser = argparse.ArgumentParser(
         description="Stage D: Train Gaussian splat from scaffold + denoised views."
     )
@@ -914,7 +1172,7 @@ def parse_args() -> argparse.Namespace:
     # --- Densification ---
     parser.add_argument("--densify_from_iter", type=int, default=500)
     parser.add_argument("--densify_until_iter", type=int, default=20000)
-    parser.add_argument("--densify_grad_threshold", type=float, default=0.00005)
+    parser.add_argument("--densify_grad_threshold", type=float, default=0.0002)
     parser.add_argument("--densification_interval", type=int, default=100)
 
     # --- Opacity ---
@@ -935,6 +1193,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr_scale", type=float, default=1.0,
                         help="Multiply all learning rates by this factor (use 0.1 for Stage E)")
 
+    # --- Multi-view batch training ---
+    parser.add_argument("--batch_views", type=int, default=1,
+                        help="Number of views to sample per iteration (default: 1)")
+
+    # --- Early stopping ---
+    parser.add_argument("--early_stopping", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable early stopping on validation PSNR plateau")
+    parser.add_argument("--val_fraction", type=float, default=0.1,
+                        help="Fraction of views held out for validation (default: 0.1)")
+    parser.add_argument("--patience_iters", type=int, default=2000,
+                        help="Stop after this many iters without val PSNR improvement")
+
+    # --- Mixed precision ---
+    parser.add_argument("--mixed_precision", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use FP16 autocast for rendering (positions stay FP32)")
+
     # --- Other ---
     parser.add_argument("--sh_degree", type=int, default=3)
     parser.add_argument("--max_init_points", type=int, default=200000,
@@ -942,13 +1216,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_interval", type=int, default=5000)
     parser.add_argument("--device", type=str, default="cuda")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Validate: must have either --scaffold_ply or --init_ply
     if args.scaffold_ply is None and args.init_ply is None:
         parser.error("Either --scaffold_ply or --init_ply must be provided.")
 
-    return args
+    return apply_config_defaults(args, _cli_flags(argv))
 
 
 def main():

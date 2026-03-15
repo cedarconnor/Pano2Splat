@@ -20,6 +20,8 @@ one2scene:
   denoise_ckpt: "./models/one2scene_denoise.ckpt"
 
 # --- Stage B: Camera Trajectory ---
+# Optional custom fallback when Stage A did not already produce target_cameras.json.
+# The default One2Scene flow uses its built-in 160-view trajectory.
 trajectory:
   n_rings: 5
   rings:
@@ -73,15 +75,19 @@ training:
   rotation_lr: 0.001
   sh_degree: 3
 
-  # Densification
+  # Densification — standard 3DGS threshold (0.0002) with KNN-initialized scales
   densify_from_iter: 500
-  densify_until_iter: 20000
-  densify_grad_threshold: 0.00005
+  densify_until_iter: 15000
+  densify_grad_threshold: 0.0002
   densification_interval: 100
 
   # Opacity reset
-  opacity_reset_interval: 3000
+  opacity_reset_interval: 100000
   min_opacity: 0.005
+  max_init_points: 200000
+
+  # Single view per iteration (more stable, fits VRAM with large Gaussian counts)
+  batch_views: 1
 
   # Loss weights
   lambda_l1: 0.8
@@ -90,8 +96,16 @@ training:
   depth_anneal_start: 0
   depth_anneal_end: 15000
 
+  # Early stopping
+  early_stopping: false
+  val_fraction: 0.1
+  patience_iters: 3000
+
+  # Mixed precision
+  mixed_precision: false
+
   # Checkpointing
-  checkpoint_interval: 5000
+  checkpoint_interval: 10000
 
   # Safety
   max_gaussians_warning: 3000000
@@ -99,11 +113,12 @@ training:
 # --- Stage E: Upscale Refinement ---
 upscale:
   sr_scale: 4
-  sr_model: "RealESRGAN_x4plus"
+  sr_model: "SeedVR2_3B_fp16"
   finetune_iterations: 10000
   lr_scale: 0.1
   densify_grad_threshold: 0.0002
   lambda_depth: 0.05
+  opacity_reset_interval: 100000  # disable during fine-tune (was collapsing opacities)
 
 # --- Stage F: Export ---
 export:

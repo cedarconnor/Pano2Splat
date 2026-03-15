@@ -213,12 +213,139 @@ def extract_from_data_pth(data_pth_path: str, output_dir: str):
     }
 
 
+def extract_real_gaussians(data_pth_path: str, output_ply_path: str) -> int | None:
+    """Extract real Gaussian parameters from data.pth if available.
+
+    One2Scene computes real covariances, harmonics, and opacities but storePly()
+    only saves XYZ+RGB. When the patched model_wrapper saves full Gaussian state,
+    this function uses decompose_covariance() to recover scales and rotations,
+    producing a much better scaffold initialization.
+
+    Returns number of Gaussians saved, or None if real params not available.
+    """
+    data = torch.load(data_pth_path, map_location="cpu", weights_only=False)
+
+    # Check if real Gaussian params were saved
+    if "gaussian_covariances" not in data:
+        return None
+
+    print("Extracting REAL Gaussian parameters from data.pth...")
+
+    means = data["gaussian_means"]          # (N, 3)
+    covariances = data["gaussian_covariances"]  # (N, 3, 3)
+    harmonics = data["gaussian_harmonics"]  # (N, 3, d_sh)
+    opacities_raw = data["gaussian_opacities"]  # (N,)
+
+    n = means.shape[0]
+    print(f"  Found {n:,} Gaussians with real parameters")
+
+    # 1. Positions
+    positions = means.numpy().astype(np.float32)
+
+    # 2. Decompose covariances -> log-scales + quaternions
+    log_scales, rotations = decompose_covariance(covariances)
+    log_scales = log_scales.numpy().astype(np.float32)
+    rotations = rotations.numpy().astype(np.float32)
+
+    # Report scale statistics
+    actual_scales = np.exp(log_scales)
+    print(f"  Scales: min={actual_scales.min():.6f}, median={np.median(actual_scales):.6f}, "
+          f"max={actual_scales.max():.6f}")
+
+    # 3. SH coefficients from harmonics (N, 3, d_sh)
+    # harmonics[:, :, 0] is DC component -> sh_dc (N, 3)
+    # harmonics[:, :, 1:] are higher-order -> sh_rest
+    C0 = 0.28209479177387814
+    d_sh = harmonics.shape[2]
+
+    # One2Scene harmonics are in a different convention than 3DGS PLY storage.
+    # The DC component (band 0) maps to color as: color = h[:, :, 0] * C0 + 0.5
+    # 3DGS PLY stores sh_dc as (color - 0.5) / C0 = h[:, :, 0]
+    sh_dc = harmonics[:, :, 0].numpy().astype(np.float32)  # (N, 3)
+
+    if d_sh > 1:
+        # Higher-order SH: harmonics is (N, 3, d_sh), rest is (N, 3, d_sh-1)
+        # PLY stores sh_rest interleaved as (N, (d_sh-1)*3)
+        sh_higher = harmonics[:, :, 1:]  # (N, 3, d_sh-1)
+        n_rest_per_channel = d_sh - 1
+        # Interleave: for each SH index, store R, G, B
+        sh_rest = sh_higher.permute(0, 2, 1).reshape(n, n_rest_per_channel * 3)
+        sh_rest = sh_rest.numpy().astype(np.float32)
+        print(f"  SH degree: {int(np.sqrt(d_sh)) - 1} ({d_sh} coefficients, "
+              f"{n_rest_per_channel} higher-order per channel)")
+    else:
+        sh_rest = np.zeros((n, 0), dtype=np.float32)
+        print(f"  SH degree: 0 (DC only)")
+
+    # 4. Opacities: convert to logit space (inverse sigmoid)
+    # Clamp to avoid inf in logit
+    opacities_clamped = opacities_raw.clamp(1e-4, 1.0 - 1e-4)
+    opacities_logit = torch.log(opacities_clamped / (1.0 - opacities_clamped))
+    opacities_np = opacities_logit.numpy().astype(np.float32).reshape(-1, 1)
+
+    # Report opacity statistics
+    opacities_activated = torch.sigmoid(opacities_logit)
+    print(f"  Opacities: min={opacities_activated.min():.4f}, "
+          f"median={opacities_activated.median():.4f}, "
+          f"max={opacities_activated.max():.4f}, "
+          f">{0.5:.0%}: {(opacities_activated > 0.5).float().mean():.1%}")
+
+    # Report rotation statistics
+    rot_norms = np.linalg.norm(rotations, axis=1)
+    print(f"  Quaternion norms: min={rot_norms.min():.4f}, "
+          f"mean={rot_norms.mean():.4f}, max={rot_norms.max():.4f}")
+
+    gaussians = {
+        "positions": positions,
+        "scales": log_scales,
+        "rotations": rotations,
+        "opacities": opacities_np,
+        "sh_dc": sh_dc,
+        "sh_rest": sh_rest,
+    }
+
+    save_ply(output_ply_path, gaussians)
+    print(f"  Saved {n:,} real Gaussians to {output_ply_path}")
+    return n
+
+
+def _compute_knn_scales(positions: np.ndarray, k: int = 3) -> np.ndarray:
+    """Compute initial scales from K-nearest-neighbor distances.
+
+    This is the standard 3DGS initialization: each Gaussian's scale is set to
+    the mean distance to its K nearest neighbors. This gives geometrically
+    plausible starting sizes instead of arbitrary uniform values.
+
+    Args:
+        positions: (N, 3) point positions.
+        k: Number of nearest neighbors.
+
+    Returns:
+        (N, 3) log-space scales (isotropic, same value on all 3 axes).
+    """
+    from scipy.spatial import KDTree
+
+    print(f"  Computing K-nearest-neighbor scales (k={k}) on {len(positions):,} points...")
+    tree = KDTree(positions)
+    dists, _ = tree.query(positions, k=k + 1)  # +1 because first neighbor is self
+    nn_dists = dists[:, 1:k + 1].mean(axis=1)  # (N,) mean distance to k neighbors
+
+    # Clamp to reasonable range
+    nn_dists = np.clip(nn_dists, 1e-6, 10.0).astype(np.float32)
+    log_scales = np.log(nn_dists)
+
+    print(f"    Scale range: [{np.exp(log_scales.min()):.6f}, {np.exp(log_scales.max()):.6f}]")
+    print(f"    Scale median: {np.exp(np.median(log_scales)):.6f}")
+
+    return np.stack([log_scales] * 3, axis=-1)  # (N, 3) isotropic
+
+
 def convert_fused_ply_to_3dgs(fused_ply_path: str, output_ply_path: str):
     """Convert One2Scene's fused.ply (XYZ+RGB) to a minimal 3DGS PLY.
 
-    Since fused.ply only has positions and colors (no scales, rotations, or
-    SH coefficients), we initialize with default values suitable for scaffold
-    training initialization.
+    Fallback path when real Gaussian parameters are not available in data.pth.
+    Uses KNN-based scale initialization (standard 3DGS approach) instead of
+    arbitrary uniform scales.
     """
     from plyfile import PlyData
 
@@ -239,8 +366,8 @@ def convert_fused_ply_to_3dgs(fused_ply_path: str, output_ply_path: str):
     ).astype(np.float32) / 255.0
     sh_dc = (rgb - 0.5) / C0
 
-    # Default scales (small, log-space)
-    log_scale = np.log(np.full((n, 3), 0.01, dtype=np.float32))
+    # Scales from K-nearest-neighbor distances (standard 3DGS initialization)
+    log_scale = _compute_knn_scales(positions, k=3)
 
     # Default rotations (identity quaternion wxyz)
     rotations = np.zeros((n, 4), dtype=np.float32)
@@ -376,6 +503,10 @@ def main():
         "--output_dir", type=str, default="pipeline_output/stage_a",
         help="Output directory",
     )
+    parser.add_argument(
+        "--force_fabricated", action="store_true",
+        help="Force fabricated params even if real Gaussian params exist in data.pth",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -383,20 +514,36 @@ def main():
     # Extract cameras and images from data.pth
     info = extract_from_data_pth(args.data_pth, args.output_dir)
 
-    # Convert fused.ply to standard 3DGS format
-    fused_ply = args.fused_ply
-    if fused_ply is None:
-        # Auto-detect: fused.ply is in same directory as data.pth
-        candidate = os.path.join(os.path.dirname(args.data_pth), "fused.ply")
-        if os.path.exists(candidate):
-            fused_ply = candidate
+    # Convert to standard 3DGS format.
+    # Prefer real Gaussian params from data.pth, fall back to fused.ply.
+    scaffold_ply_path = os.path.join(args.output_dir, "scaffold_gaussians.ply")
+    if args.force_fabricated:
+        print("--force_fabricated: skipping real Gaussian extraction")
+        n = None
+    else:
+        n = extract_real_gaussians(args.data_pth, scaffold_ply_path)
 
-    if fused_ply and os.path.exists(fused_ply):
-        scaffold_ply_path = os.path.join(args.output_dir, "scaffold_gaussians.ply")
-        n = convert_fused_ply_to_3dgs(fused_ply, scaffold_ply_path)
+    if n is not None:
         info["n_gaussians"] = n
+        info["scaffold_source"] = "real_params"
+    else:
+        # Fallback: fused.ply with fabricated params
+        fused_ply = args.fused_ply
+        if fused_ply is None:
+            candidate = os.path.join(os.path.dirname(args.data_pth), "fused.ply")
+            if os.path.exists(candidate):
+                fused_ply = candidate
 
-        # Render depth maps from scaffold at anchor cameras
+        if fused_ply and os.path.exists(fused_ply):
+            n = convert_fused_ply_to_3dgs(fused_ply, scaffold_ply_path)
+            info["n_gaussians"] = n
+            info["scaffold_source"] = "fabricated"
+        else:
+            print(f"WARNING: No fused.ply found. Scaffold PLY not created.")
+            print(f"  Checked: {fused_ply or 'auto-detect from data_pth dir'}")
+
+    # Render depth maps from scaffold at anchor cameras
+    if os.path.exists(scaffold_ply_path):
         anchor_cameras_path = os.path.join(
             args.output_dir, "anchor_cameras", "cameras.json"
         )
@@ -410,9 +557,6 @@ def main():
                 args.output_dir,
             )
             info["n_depth_maps"] = n_depths
-    else:
-        print(f"WARNING: No fused.ply found. Scaffold PLY not created.")
-        print(f"  Checked: {fused_ply or 'auto-detect from data_pth dir'}")
 
     # Save extraction info
     info_path = os.path.join(args.output_dir, "extraction_info.json")

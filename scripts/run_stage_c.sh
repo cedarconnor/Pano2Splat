@@ -15,10 +15,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 ONE2SCENE_DIR="$PROJECT_ROOT/third_party/One2Scene"
 DENOISE_DIR="$ONE2SCENE_DIR/src_denoise"
+source "$SCRIPT_DIR/common.sh"
 
-# Paths
-STAGE_A_OUT="$PROJECT_ROOT/pipeline_output/stage_a"
-STAGE_C_OUT="$PROJECT_ROOT/pipeline_output/stage_c"
+# Paths (respects OUTPUT_ROOT env var from run_pipeline.sh)
+_OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/pipeline_output}"
+STAGE_A_OUT="$_OUTPUT_ROOT/stage_a"
+STAGE_C_OUT="$_OUTPUT_ROOT/stage_c"
 DENOISE_CKPT="$PROJECT_ROOT/models/one2scene_denoise.ckpt"
 SEVA_CONFIG="$DENOISE_DIR/configs/seva_denoise_mostclosecamera.yaml"
 
@@ -73,6 +75,12 @@ mkdir -p "$STAGE_C_OUT"
 SEVA_DENOISE_OUT="$STAGE_C_OUT/seva_output"
 mkdir -p "$SEVA_DENOISE_OUT"
 
+# Convert Git Bash paths to mixed-mode Windows paths (forward slashes) for
+# Python + YAML compatibility. cygpath -m gives D:/... instead of D:\...
+# which avoids YAML escape-character issues with backslashes.
+WIN_DATA_PTH=$(cygpath -m "$DATA_PTH" 2>/dev/null || echo "$DATA_PTH")
+WIN_SEVA_DENOISE_OUT=$(cygpath -m "$SEVA_DENOISE_OUT" 2>/dev/null || echo "$SEVA_DENOISE_OUT")
+
 # Create an override config that patches the hardcoded paths
 OVERRIDE_CONFIG="$STAGE_C_OUT/seva_override.yaml"
 cat > "$OVERRIDE_CONFIG" << YAML
@@ -80,11 +88,11 @@ cat > "$OVERRIDE_CONFIG" << YAML
 # Points datafolder to Stage A output and save_dir to Stage C output.
 test_data:
   params:
-    datafolder: "${DATA_PTH}"
+    datafolder: "${WIN_DATA_PTH}"
 
 model:
   params:
-    save_dir: "${SEVA_DENOISE_OUT}"
+    save_dir: "${WIN_SEVA_DENOISE_OUT}"
 YAML
 
 echo "  Override config: $OVERRIDE_CONFIG"
@@ -103,17 +111,29 @@ START_TIME=$(date +%s)
 
 cd "$DENOISE_DIR"
 
-CUDA_VISIBLE_DEVICES=0 torchrun \
-    --nnodes=1 \
-    --nproc_per_node=1 \
-    --master_addr=localhost \
-    --master_port=21471 \
-    main.py \
-    --base "$SEVA_CONFIG" "$OVERRIDE_CONFIG" \
-    --no_date \
-    --train=False \
-    --debug \
-    --resume="$DENOISE_CKPT"
+# Skip downloading gated base weights — checkpoint resume overwrites them.
+export SEVA_SKIP_BASE_WEIGHTS=1
+
+if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
+    # Windows: gloo/torchrun broken, run with python directly (auto strategy)
+    echo "  [Windows] Using python directly (no torchrun)"
+    CUDA_VISIBLE_DEVICES=0 run_project_python "$PROJECT_ROOT" main.py \
+        --base "$SEVA_CONFIG" "$OVERRIDE_CONFIG" \
+        --no_date \
+        --train=False \
+        --resume="$DENOISE_CKPT"
+else
+    CUDA_VISIBLE_DEVICES=0 torchrun \
+        --nnodes=1 \
+        --nproc_per_node=1 \
+        --master_addr=localhost \
+        --master_port=21471 \
+        main.py \
+        --base "$SEVA_CONFIG" "$OVERRIDE_CONFIG" \
+        --no_date \
+        --train=False \
+        --resume="$DENOISE_CKPT"
+fi
 
 cd "$PROJECT_ROOT"
 
@@ -174,15 +194,19 @@ if [ -z "$FRAME_SRC" ]; then
 else
     echo "  Source: $FRAME_SRC"
 
-    # Copy and rename frames to frame_000.png, frame_001.png, etc.
-    # WARNING: SEVA may output conditioning frames (first 6) alongside
-    # denoised target frames.  The video export in model_wrapper.py
-    # skips the first 6 with image[6:].  If SEVA outputs numbered PNGs,
-    # we may need to skip the first 6 here too so that frame indices
-    # align with target_cameras.json.  Verify after first successful
-    # Stage C run.
+    # Copy denoised target frames, SKIPPING the first 6 conditioning frames.
+    # SEVA saves conditioning frames (indices 000000-000005) before denoised
+    # targets (indices 000006+). target_cameras.json only covers the 160
+    # target views, so we must skip the 6 conditioning frames to keep
+    # frame indices aligned with cameras.
     IDX=0
+    SKIP=6
+    SEEN=0
     for F in $(find "$FRAME_SRC" -maxdepth 1 -name "*.png" ! -name "*_input*" | sort); do
+        SEEN=$((SEEN + 1))
+        if [ "$SEEN" -le "$SKIP" ]; then
+            continue
+        fi
         cp "$F" "$DENOISED_DIR/frame_$(printf '%03d' $IDX).png"
         IDX=$((IDX + 1))
     done
@@ -198,7 +222,7 @@ else
     # Record resolution
     FIRST_FRAME="$DENOISED_DIR/frame_000.png"
     if [ -f "$FIRST_FRAME" ]; then
-        python -c "
+        run_project_python "$PROJECT_ROOT" -c "
 from PIL import Image
 img = Image.open('$FIRST_FRAME')
 w, h = img.size
@@ -230,7 +254,7 @@ fi
 
 if [ "$FRAME_COUNT" -lt 10 ]; then
     echo ""
-    echo "  [WARN] Low frame count ($FRAME_COUNT). Expected ~100+."
+    echo "  [WARN] Low frame count ($FRAME_COUNT). Expected 160 target frames."
     echo "  Check discovery_log.txt and SEVA output logs."
 fi
 
